@@ -29,7 +29,7 @@ class RT_Transcoder_Handler {
 	 * @access   protected
 	 * @var      string    $transcoding_api_url    The URL of the api.
 	 */
-	protected $transcoding_api_url = 'http://api.rtmedia.io/api/v1/';
+	protected $transcoding_api_url = 'http://dev.api.rtmedia.io/api/v1/';
 
 	/**
 	 * The URL of the EDD store.
@@ -159,11 +159,12 @@ class RT_Transcoder_Handler {
 	 *
 	 * @since 1.0.0
 	 *
-	 * @param array  $metadata 			Metadata of the attachment.
-	 * @param int    $attachment_id		ID of attachment.
-	 * @param string $autoformat		If true then generating thumbs only else trancode video.
+	 * @param array  $metadata 			   Metadata of the attachment.
+	 * @param int    $attachment_id		   ID of attachment.
+	 * @param string $autoformat		   If true then generating thumbs only else trancode video.
+	 * @param bool   $create_multi_quality If true multiple quality videos will be created for the media.
 	 */
-	function wp_media_transcoding( $wp_metadata, $attachment_id, $autoformat = true ) {
+	function wp_media_transcoding( $wp_metadata, $attachment_id, $autoformat = true, $create_multi_quality = false ) {
 		if ( empty( $wp_metadata['mime_type'] ) ) {
 			return $wp_metadata;
 		}
@@ -195,11 +196,6 @@ class RT_Transcoder_Handler {
 			}
 
 			$job_type = 'video';
-			/**  FORMAT * */
-			if ( 'video/mp4' === $metadata['mime_type'] && 'mp4' === $type ) {
-				$autoformat = 'thumbnails';
-				$job_type = 'thumbnail';
-			}
 
 			if ( 'audio' === $type_array[0] ) {
 				$job_type = 'audio';
@@ -223,7 +219,7 @@ class RT_Transcoder_Handler {
 				'timeout' 	=> 60,
 				'body' 		=> array(
 					'api_token' 	=> $this->api_key,
-					'job_type' 		=> $job_type,
+					'job_type' 		=> ( $this->is_block_media() || $create_multi_quality ) ? 'amp-story' : $job_type,
 					'job_for' 		=> $job_for,
 					'file_url'		=> urlencode( $url ),
 					'callback_url'	=> urlencode( trailingslashit( home_url() ) . 'index.php' ),
@@ -235,11 +231,10 @@ class RT_Transcoder_Handler {
 
 			$transcoding_url = $this->transcoding_api_url . 'job/';
 
-			$upload_page = wp_remote_post( $transcoding_url, $args );
-
+			$upload_page     = wp_remote_post( $transcoding_url, $args );
 			if ( ! is_wp_error( $upload_page ) && ( ( isset( $upload_page['response']['code'] ) && ( 200 === intval( $upload_page['response']['code'] ) ) ) ) ) {
 				$upload_info = json_decode( $upload_page['body'] );
-				if ( isset( $upload_info->status ) && $upload_info->status && isset( $upload_info->job_id ) && $upload_info->job_id ) {
+				if ( ! empty( $upload_info->status ) && 'success' === $upload_info->status && ! empty( $upload_info->job_id ) ) {
 					$job_id = $upload_info->job_id;
 					update_post_meta( $attachment_id, '_rt_transcoding_job_id', $job_id );
 				}
@@ -248,6 +243,40 @@ class RT_Transcoder_Handler {
 		}
 
 		return $wp_metadata;
+	}
+
+	/**
+	 * Check if the media has whitelisted blocks to create multi quality videos.
+	 *
+	 * @since 1.4
+	 *
+	 * @return boolean
+	 */
+	private function is_block_media() {
+
+		// Verify usage of block function.
+		if ( ! function_exists( 'has_block' ) ) {
+			return false;
+		}
+
+		// Store action param to verify if an upload is being done via AJAX.
+		$action = filter_input( INPUT_POST, 'action', FILTER_SANITIZE_STRING );
+
+		// Get current Post ID.
+		$post_id = intval( filter_input( INPUT_POST, 'post_id', FILTER_SANITIZE_NUMBER_INT ) );
+
+		// Post ID while requesting on WP REST API i.e. from video block.
+		$rest_post_id = intval( filter_input( INPUT_POST, 'post', FILTER_SANITIZE_NUMBER_INT ) );
+
+		// Check if post has AMP Story Page Block.
+		$is_amp_story_block = ( has_block( 'amp/amp-story-page', $post_id ) || has_block( 'amp/amp-story-page', $rest_post_id ) );
+
+		// If either of blocks are found or if an upload using AJAX.
+		if ( $is_amp_story_block || ( ! empty( $rest_post_id ) && get_post_type( $rest_post_id ) === 'amp_story' ) || ( 'upload-attachment' === $action && get_post_type( $post_id ) === 'amp_story' ) ) {
+			return true;
+		}
+
+		return false;
 	}
 
 	/**
@@ -944,6 +973,7 @@ class RT_Transcoder_Handler {
 				}
 			}
 		}
+
 		if ( ! empty( $transcoded_files ) ) {
 			update_post_meta( $attachment_id, '_rt_media_transcoded_files', $transcoded_files );
 			do_action( 'transcoded_media_added', $attachment_id );
@@ -960,9 +990,9 @@ class RT_Transcoder_Handler {
 	 *
 	 * @return int|bool		Return post id if found else false.
 	 */
-	function get_post_id_by_meta_key_and_value( $key, $value ) {
+	function  get_post_id_by_meta_key_and_value( $key, $value ) {
 		global $wpdb;
-		$meta = $wpdb->get_results( $wpdb->prepare( 'SELECT * FROM ' . $wpdb->postmeta . ' WHERE meta_key = %s AND meta_value = %s', $key, $value ) ); // @codingStandardsIgnoreLine
+		$meta = $wpdb->get_results( $wpdb->prepare( 'SELECT * FROM ' . $wpdb->postmeta . ' WHERE meta_key like %s AND meta_value = %s', $key, $value ) ); // @codingStandardsIgnoreLine
 
 		if ( is_array( $meta ) && ! empty( $meta ) && isset( $meta[0] ) ) {
 			$meta = $meta[0];
@@ -982,14 +1012,14 @@ class RT_Transcoder_Handler {
 	public function handle_callback() {
 		require_once( ABSPATH . 'wp-admin/includes/image.php' );
 
-		$job_id			= filter_input( INPUT_POST, 'job_id', FILTER_SANITIZE_STRING );
-		$status			= filter_input( INPUT_POST, 'status', FILTER_SANITIZE_STRING );
-		$file_status 	= filter_input( INPUT_POST, 'file_status', FILTER_SANITIZE_STRING );
-		$error_msg		= filter_input( INPUT_POST, 'error_msg', FILTER_SANITIZE_STRING );
-		$error_code		= filter_input( INPUT_POST, 'error_code', FILTER_SANITIZE_STRING );
-		$job_for		= filter_input( INPUT_POST, 'job_for', FILTER_SANITIZE_STRING );
-		$thumbnail		= filter_input( INPUT_POST, 'thumbnail', FILTER_SANITIZE_STRING );
-		$format			= filter_input( INPUT_POST, 'format', FILTER_SANITIZE_STRING );
+		$job_id      = filter_input( INPUT_POST, 'job_id', FILTER_SANITIZE_STRING );
+		$status      = filter_input( INPUT_POST, 'status', FILTER_SANITIZE_STRING );
+		$file_status = filter_input( INPUT_POST, 'file_status', FILTER_SANITIZE_STRING );
+		$error_msg   = filter_input( INPUT_POST, 'error_msg', FILTER_SANITIZE_STRING );
+		$error_code  = filter_input( INPUT_POST, 'error_code', FILTER_SANITIZE_STRING );
+		$job_for     = filter_input( INPUT_POST, 'job_for', FILTER_SANITIZE_STRING );
+		$thumbnail   = filter_input( INPUT_POST, 'thumbnail', FILTER_SANITIZE_STRING );
+		$format      = filter_input( INPUT_POST, 'format', FILTER_SANITIZE_STRING );
 
 		if ( ! empty( $job_id )  && ! empty( $file_status ) && ( 'error' === $file_status ) ) {
 			$send_alert = $this->nofity_transcoding_failed( $job_id, $error_msg );
@@ -1001,12 +1031,14 @@ class RT_Transcoder_Handler {
 
 		// @codingStandardsIgnoreStart
 		if ( isset( $job_for ) && ( 'wp-media' === $job_for ) ) {
+
 			if ( isset( $job_id ) ) {
+
 				$has_thumbs = isset( $thumbnail ) ? true : false;
 				$flag       = false;
 				global $wpdb;
 
-				$id = $this->get_post_id_by_meta_key_and_value( '_rt_transcoding_job_id', $job_id );
+				$id       = $this->get_post_id_by_meta_key_and_value( '_rt_transcoding%job_id', $job_id );
 
 				if ( isset( $id ) && is_numeric( $id ) ) {
 					$attachment_id      	= $id;
@@ -1054,7 +1086,9 @@ class RT_Transcoder_Handler {
 				die();
 			}
 		} else {
+
 			if ( isset( $job_id ) ) {
+
 				$has_thumbs = isset( $thumbnail ) ? true : false;
 				$flag       = false;
 				global $wpdb;
@@ -1089,6 +1123,8 @@ class RT_Transcoder_Handler {
 						$uploded_files = $this->add_transcoded_files( $_REQUEST['files'], $attachment_id, $job_for );
 					}
 
+
+
 				} else {
 					$flag = esc_html__( 'Something went wrong. The required attachment id does not exists. It must have been deleted.', 'transcoder' );
 				}
@@ -1116,6 +1152,7 @@ class RT_Transcoder_Handler {
 				die();
 			}
 		}
+
 		// @codingStandardsIgnoreEnd
 
 		/**
